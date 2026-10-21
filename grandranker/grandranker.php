@@ -3,14 +3,14 @@
  * Plugin Name: Grandranker
  * Plugin URI:  https://grandranker.com
  * Description: Automatically publish and update SEO-optimized articles from Grandranker — the AI content platform that helps you rank higher on Google and AI search engines.
- * Version:     1.7.0
+ * Version:     1.7.1
  * Author:      Grandranker
  * License:     MIT
  */
 
 defined('ABSPATH') || exit;
 
-const GRANDRANKER_VERSION       = '1.7.0';
+const GRANDRANKER_VERSION       = '1.7.1';
 const GRANDRANKER_API_BASE      = 'https://app.grandranker.com';
 // Body images on these hosts are copied into the Media Library (task 934).
 const GRANDRANKER_IMAGE_HOSTS   = ['cdn.grandranker.com'];
@@ -1396,6 +1396,8 @@ function grandranker_render_settings_page() {
         );
         if ($result === true) {
             $connected = $just_connected = true;
+            // Read after the exchange saved it, or the page warns "a connection key is required".
+            $connection_key = (string) get_option(GRANDRANKER_OPT_TOKEN, '');
         } else {
             $connect_error = $result->get_error_code();
         }

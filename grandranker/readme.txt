@@ -4,7 +4,7 @@ Tags: seo, ai, content, publishing, articles
 Requires at least: 5.6
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.7.0
+Stable tag: 1.7.1
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -66,6 +66,9 @@ The article is sent to your WordPress site via a signed REST API call. The plugi
 Yes. Grandranker can send a delete request to move the WordPress post to the trash.
 
 == Changelog ==
+
+= 1.7.1 =
+* Fix: the page right after connecting no longer asks for a connection key.
 
 = 1.7.0 =
 * Connects by itself after activation — no key needed.
