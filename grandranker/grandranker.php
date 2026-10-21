@@ -3,14 +3,14 @@
  * Plugin Name: Grandranker
  * Plugin URI:  https://grandranker.com
  * Description: Automatically publish and update SEO-optimized articles from Grandranker — the AI content platform that helps you rank higher on Google and AI search engines.
- * Version:     1.6.1
+ * Version:     1.7.0
  * Author:      Grandranker
  * License:     MIT
  */
 
 defined('ABSPATH') || exit;
 
-const GRANDRANKER_VERSION       = '1.6.1';
+const GRANDRANKER_VERSION       = '1.7.0';
 const GRANDRANKER_API_BASE      = 'https://app.grandranker.com';
 // Body images on these hosts are copied into the Media Library (task 934).
 const GRANDRANKER_IMAGE_HOSTS   = ['cdn.grandranker.com'];
@@ -28,6 +28,8 @@ const GRANDRANKER_OPT_DEFAULT_AUTHOR = 'grandranker_default_author';
 const GRANDRANKER_OPT_POST_STATUS    = 'grandranker_post_status';
 const GRANDRANKER_OPT_SEO_PLUGIN     = 'grandranker_seo_plugin';
 const GRANDRANKER_OPT_INDEXNOW_KEY   = 'grandranker_indexnow_key';
+const GRANDRANKER_OPT_CONNECT_STATE  = 'grandranker_connect_state';
+const GRANDRANKER_TRANSIENT_ACTIVATION_REDIRECT = 'grandranker_activation_redirect';
 
 // ---------------------------------------------------------------------------
 // IndexNow — Grandranker sends the site's key with each article, and this
@@ -61,6 +63,10 @@ add_action('init', function () {
 // Connect — exchange the API token for an HMAC signing secret.
 // ---------------------------------------------------------------------------
 
+function grandranker_is_connected(): bool {
+    return !empty(get_option(GRANDRANKER_OPT_SECRET));
+}
+
 function grandranker_connect($api_token) {
     update_option(GRANDRANKER_OPT_TOKEN, $api_token);
     update_option(GRANDRANKER_OPT_SITE_URL, home_url());
@@ -90,6 +96,71 @@ function grandranker_connect($api_token) {
     }
 
     update_option(GRANDRANKER_OPT_SECRET, $body['data']['signing_secret']);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Self-connect — after activation the site visits GrandRanker, which sends it
+// back with a one-time code. The plugin trades the code for the same
+// credentials the connection key gives. The state ties the return to this
+// site's own request.
+// ---------------------------------------------------------------------------
+
+function grandranker_new_connect_state(): string {
+    $state = wp_generate_password(32, false);
+    update_option(GRANDRANKER_OPT_CONNECT_STATE, ['state' => $state, 'expires' => time() + 900]);
+    return $state;
+}
+
+function grandranker_connect_url(): string {
+    $stored = get_option(GRANDRANKER_OPT_CONNECT_STATE, []);
+    $state  = is_array($stored) ? (string) ($stored['state'] ?? '') : '';
+
+    return GRANDRANKER_API_BASE . '/wordpress/connect?site=' . rawurlencode(home_url())
+        . '&state=' . rawurlencode($state)
+        . '&return=' . rawurlencode(admin_url('admin.php?page=grandranker'));
+}
+
+/** Returns true, or a WP_Error whose code is 'expired', 'paused' or 'failed'. */
+function grandranker_complete_connect(string $code, string $state) {
+    $stored   = get_option(GRANDRANKER_OPT_CONNECT_STATE, []);
+    $expected = is_array($stored) ? (string) ($stored['state'] ?? '') : '';
+    $expires  = is_array($stored) ? (int) ($stored['expires'] ?? 0) : 0;
+
+    if ($expected === '' || !hash_equals($expected, $state)) {
+        return new WP_Error('failed', 'The connect state does not match.');
+    }
+    if ($expires < time()) {
+        return new WP_Error('expired', 'The connect link expired.');
+    }
+
+    $response = wp_remote_post(GRANDRANKER_API_BASE . '/api/v1/plugin/exchange', [
+        'timeout' => 15,
+        'headers' => [
+            'Content-Type' => 'application/json',
+            'Accept'       => 'application/json',
+        ],
+        'body' => wp_json_encode(['code' => $code, 'state' => $state, 'site_url' => home_url()]),
+    ]);
+
+    if (is_wp_error($response)) {
+        return new WP_Error('failed', $response->get_error_message());
+    }
+
+    $status = (int) wp_remote_retrieve_response_code($response);
+    $body   = json_decode((string) wp_remote_retrieve_body($response), true);
+
+    if ($status === 410) return new WP_Error('expired', 'The connect code was used or expired.');
+    if ($status === 402) return new WP_Error('paused', 'The GrandRanker plan is paused.');
+    // The exchange replies with top-level keys (no `data` wrapper, unlike /plugin/connect).
+    if ($status !== 200 || empty($body['signing_secret']) || empty($body['api_token'])) {
+        return new WP_Error('failed', "Connect failed (HTTP {$status})");
+    }
+
+    update_option(GRANDRANKER_OPT_TOKEN, $body['api_token']);
+    update_option(GRANDRANKER_OPT_SECRET, $body['signing_secret']);
+    update_option(GRANDRANKER_OPT_SITE_URL, home_url());
+    delete_option(GRANDRANKER_OPT_CONNECT_STATE);
     return true;
 }
 
@@ -237,7 +308,7 @@ function grandranker_receive_article(WP_REST_Request $request) {
         'post_name'    => sanitize_title($article['slug'] ?? $article['title']),
         'post_content' => grandranker_clean_content_html($article['content_html'] ?? ''),
         'post_excerpt' => $article['meta_description'] ?? '',
-        'post_status'  => grandranker_get_post_status(),
+        'post_status'  => grandranker_post_status_for($existing_id),
         'post_type'    => 'post',
         'meta_input'   => grandranker_build_meta_input($article),
     ];
@@ -286,6 +357,21 @@ function grandranker_clean_content_html($html) {
     $html = preg_replace('/<script\s+type=["\']application\/ld\+json["\']>.*?<\/script>\s*/s', '', $html);
     $html = preg_replace('/<link\s+rel=["\']alternate["\']\s+hreflang=["\'][^"\']*["\']\s+href=["\'][^"\']*["\']\s*\/?>\s*/i', '', $html);
     return ltrim($html);
+}
+
+/**
+ * An update never takes a live post down: with "Post status" on Draft or
+ * Pending Review, re-sending an article the customer had already published in
+ * WordPress turned it back into a draft and it vanished from the blog
+ * (task 1111). A published or scheduled post keeps its status; new posts and
+ * drafts follow the setting.
+ */
+function grandranker_post_status_for($existing_id): string {
+    if ($existing_id && in_array(get_post_status($existing_id), ['publish', 'future'], true)) {
+        return get_post_status($existing_id);
+    }
+
+    return grandranker_get_post_status();
 }
 
 function grandranker_get_post_status() {
@@ -833,6 +919,12 @@ function grandranker_mirror_images(WP_REST_Request $request) {
  * and hashes a whole large site. `next_post_id` is where the next page starts,
  * null once the last post was scanned. Without `after_post_id` every post is
  * scanned, as before.
+ *
+ * With `attachment_limit` as well (1.6.4) the page is one post, and only the
+ * next `attachment_limit` possible copies of it above `after_attachment_id`
+ * are checked, so a post with many copies is checked over several requests.
+ * `next_attachment_id` is where the next request starts inside the same post
+ * (with the same after_post_id), null once the post is done.
  */
 function grandranker_dedupe_media(WP_REST_Request $request) {
     $params = (array) $request->get_json_params();
@@ -841,9 +933,17 @@ function grandranker_dedupe_media(WP_REST_Request $request) {
 
     $posts = grandranker_own_post_ids();
     $next_post_id = null;
+    $after_attachment_id = 0;
+    $attachment_limit = null;
+    $next_attachment_id = null;
     if (array_key_exists('after_post_id', $params)) {
         $after = max(0, (int) $params['after_post_id']);
         $post_limit = min(500, max(1, (int) ($params['post_limit'] ?? 50)));
+        if (array_key_exists('attachment_limit', $params)) {
+            $attachment_limit = min(500, max(1, (int) $params['attachment_limit']));
+            $after_attachment_id = max(0, (int) ($params['after_attachment_id'] ?? 0));
+            $post_limit = 1;
+        }
         $posts = array_values(array_filter($posts, function ($id) use ($after) {
             return $id > $after;
         }));
@@ -853,7 +953,10 @@ function grandranker_dedupe_media(WP_REST_Request $request) {
         }
     }
 
-    $duplicates = grandranker_duplicate_attachments($posts);
+    $duplicates = grandranker_duplicate_attachments($posts, $after_attachment_id, $attachment_limit, $next_attachment_id);
+    if ($next_attachment_id !== null) {
+        $next_post_id = $after;
+    }
     $deleted = [];
 
     if (!$dry_run) {
@@ -871,6 +974,7 @@ function grandranker_dedupe_media(WP_REST_Request $request) {
         'remaining'  => count($duplicates) - count($deleted),
         'scanned_posts' => count($posts),
         'next_post_id'  => $next_post_id,
+        'next_attachment_id' => $next_attachment_id,
     ], 200);
 }
 
@@ -915,14 +1019,21 @@ function grandranker_own_post_ids() {
  * Looks only under $posts (Grandranker post ids; default all of them). Sizes
  * are compared before any file is hashed, and the kept file is hashed only
  * when a member of its size exists.
+ *
+ * With $attachment_limit (1.6.4, for one post with many copies) only the next
+ * $attachment_limit possible copies above $after_attachment_id are checked, in
+ * id order; $next_attachment_id is then set to the last one checked when more
+ * are left, else null.
  */
-function grandranker_duplicate_attachments($posts = null) {
+function grandranker_duplicate_attachments($posts = null, $after_attachment_id = 0, $attachment_limit = null, &$next_attachment_id = null) {
     global $wpdb;
 
     $thumbnails = array_flip(array_map('intval', $wpdb->get_col("SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_thumbnail_id'")));
     $posts = $posts ?? grandranker_own_post_ids();
 
-    $duplicates = [];
+    $candidate_groups = [];
+    $candidates = [];
+    $next_attachment_id = null;
     foreach ($posts as $post_id) {
         $children = get_posts([
             'post_type'   => 'attachment',
@@ -932,6 +1043,8 @@ function grandranker_duplicate_attachments($posts = null) {
             'fields'      => 'ids',
         ]);
         if (count($children) < 2) continue;
+        // 1.6.5 (task 1285): one query for the files of a post with 1,000+ copies.
+        update_meta_cache('post', $children);
 
         $files = [];
         $stems = [];
@@ -956,30 +1069,59 @@ function grandranker_duplicate_attachments($posts = null) {
         }
 
         $thumbnail = (int) get_post_thumbnail_id($post_id);
+        $keeps = [];
+        $todo = [];
         foreach ($groups as $base => $ids) {
             if (count($ids) < 2) continue;
 
             $keep = in_array($thumbnail, $ids, true) ? $thumbnail : min($ids);
             if (!is_file($files[$keep])) continue;
-            $keep_size = filesize($files[$keep]);
-            $keep_md5 = null;
-
-            $grandranker_name = preg_match('/-\d{10}$/', (string) $base) === 1;
-            $texts = null;
+            $keeps[$base] = ['id' => $keep, 'size' => filesize($files[$keep]), 'md5' => null];
             foreach ($ids as $attachment_id) {
                 if ($attachment_id === $keep || isset($thumbnails[$attachment_id])) continue;
-                if (!$grandranker_name && (string) get_post_meta($attachment_id, '_grandranker_source_url', true) === '') continue;
-                if (!is_file($files[$attachment_id]) || filesize($files[$attachment_id]) !== $keep_size) continue;
-                $keep_md5 = $keep_md5 ?? md5_file($files[$keep]);
-                if (!$keep_md5 || md5_file($files[$attachment_id]) !== $keep_md5) continue;
-
-                $texts = $texts ?? grandranker_texts_mentioning((string) $base, $ids);
-                $siblings = array_values(array_diff_key(array_intersect_key($stems, array_flip($ids)), [$attachment_id => true]));
-                if (grandranker_is_referenced($attachment_id, grandranker_attachment_stems($attachment_id, $files[$attachment_id]), $texts, $siblings)) continue;
-
-                $duplicates[$attachment_id] = (int) filesize($files[$attachment_id]);
+                if ($attachment_id > $after_attachment_id) $todo[$attachment_id] = $base;
             }
         }
+
+        // 1.6.4 (task 1120): a post with many copies is checked a slice at a time.
+        ksort($todo);
+        if ($attachment_limit !== null && count($todo) > $attachment_limit) {
+            $todo = array_slice($todo, 0, $attachment_limit, true);
+            $next_attachment_id = (int) array_key_last($todo);
+        }
+
+        foreach ($todo as $attachment_id => $base) {
+            $ids = $groups[$base];
+            $keep = $keeps[$base]['id'];
+            $keep_size = $keeps[$base]['size'];
+            $grandranker_name = preg_match('/-\d{10}$/', (string) $base) === 1;
+            $group = $post_id . ':' . $base;
+            if (!$grandranker_name && (string) get_post_meta($attachment_id, '_grandranker_source_url', true) === '') continue;
+            if (!is_file($files[$attachment_id]) || filesize($files[$attachment_id]) !== $keep_size) continue;
+            $keep_md5 = $keeps[$base]['md5'] = $keeps[$base]['md5'] ?? md5_file($files[$keep]);
+            if (!$keep_md5 || md5_file($files[$attachment_id]) !== $keep_md5) continue;
+
+            $own_stems = grandranker_attachment_stems($attachment_id, $files[$attachment_id]);
+            $candidate_groups[$group]['ids'] = $ids;
+            $candidate_groups[$group]['checked'][] = $attachment_id;
+            $candidate_groups[$group]['stems'] = array_values(array_unique(array_merge($candidate_groups[$group]['stems'] ?? [(string) $base], $own_stems)));
+            $candidates[$attachment_id] = [
+                'group'    => $group,
+                'file'     => $files[$attachment_id],
+                'stems'    => $own_stems,
+                'siblings' => array_values(array_diff_key(array_intersect_key($stems, array_flip($ids)), [$attachment_id => true])),
+            ];
+        }
+    }
+
+    // 1.6.3: one set of reference queries for the whole page, not one per
+    // group (task 1120: ~10 s per group on fly.nl, so a page timed out).
+    $texts = grandranker_texts_mentioning($candidate_groups);
+    $duplicates = [];
+    foreach ($candidates as $attachment_id => $candidate) {
+        if (grandranker_is_referenced($attachment_id, $candidate['stems'], $texts[$candidate['group']], $candidate['siblings'])) continue;
+
+        $duplicates[$attachment_id] = (int) filesize($candidate['file']);
     }
 
     ksort($duplicates);
@@ -987,43 +1129,95 @@ function grandranker_duplicate_attachments($posts = null) {
 }
 
 /**
- * Every text on the site that may show a file named $stem* or one of $ids:
- * post content (pages, products, templates… anything but revisions and
- * attachments), post meta (page builders, galleries, SEO plugins' Open Graph
- * images) and site options (theme settings, site icon). Meta of the group's
- * own attachments (their file name, sizes, source URL) is no use and left out,
- * as is the file meta of every other attachment (_wp_attached_file and its
- * sizes name that attachment's own file, not a use of ours).
- * A coarse SQL filter; grandranker_is_referenced() checks exactly.
+ * For each group (['stems' => file name stems, 'ids' => attachment ids,
+ * 'checked' => the ids of it being checked]),
+ * every text on the site that may show a file named after one of its stems
+ * (the group's name, and each copy's original and sizes) or one of its ids:
+ * post content
+ * (pages, products, templates… anything but revisions and attachments), post
+ * meta (page builders, galleries, SEO plugins' Open Graph images) and site
+ * options (theme settings, site icon). Meta of the group's own attachments
+ * (their file name, sizes, source URL) is no use and left out, as is the file
+ * meta of every other attachment (_wp_attached_file and its sizes name that
+ * attachment's own file, not a use of ours). An id counts in options only in
+ * the site icon and theme settings.
+ * Each table is read once for all groups, with LIKE instead of REGEXP (1.6.3).
+ * Only the ids being checked (['checked']) are searched for (1.6.5, task 1285):
+ * a group of 1,208 copies on fly.nl put every id in the LIKE list and timed
+ * out even for a slice of one; grandranker_is_referenced() looks only for the
+ * copy's own id, so the other ids found nothing it uses.
+ * A coarse filter; grandranker_is_referenced() checks exactly.
  *
- * @return string[]
+ * @return array<string, string[]> keyed like $groups
  */
-function grandranker_texts_mentioning($stem, $ids) {
+function grandranker_texts_mentioning($groups) {
     global $wpdb;
 
-    $ids = array_map('intval', $ids);
-    $like = '%' . $wpdb->esc_like($stem) . '%';
-    $id_regexp = '(^|[^0-9A-Za-z])(' . implode('|', $ids) . ')([^0-9A-Za-z]|$)';
-    $own = implode(',', $ids);
+    $result = array_fill_keys(array_keys($groups), []);
+    if (!$groups) return $result;
+
+    $terms = [];
+    foreach ($groups as $group) {
+        foreach ($group['stems'] as $stem) $terms[] = strtolower((string) $stem);
+        foreach ($group['checked'] as $id) $terms[] = (string) (int) $id;
+    }
+    // x-300x200 is already found by LIKE '%x%'; each term costs a pass per row.
+    $terms = array_values(array_filter(array_unique($terms), function ($term) use ($terms) {
+        foreach ($terms as $other) {
+            if ($other !== $term && $other !== '' && stripos($term, $other) !== false) return false;
+        }
+        return $term !== '';
+    }));
+    $likes = array_map(function ($term) use ($wpdb) {
+        return '%' . $wpdb->esc_like($term) . '%';
+    }, $terms);
+    $any = function ($column) use ($terms) {
+        return '(' . implode(' OR ', array_fill(0, count($terms), "$column LIKE %s")) . ')';
+    };
 
     $contents = $wpdb->get_col($wpdb->prepare(
-        "SELECT post_content FROM {$wpdb->posts} WHERE post_type NOT IN ('revision', 'attachment') AND (post_content LIKE %s OR post_content REGEXP %s)",
-        $like,
-        $id_regexp
+        "SELECT post_content FROM {$wpdb->posts} WHERE post_type NOT IN ('revision', 'attachment') AND " . $any('post_content'),
+        $likes
     ));
-    $meta = $wpdb->get_col($wpdb->prepare(
-        "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id NOT IN ($own) AND meta_key NOT IN ('_edit_lock', '_edit_last', '_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_backup_sizes') AND (meta_value LIKE %s OR meta_value REGEXP %s)",
-        $like,
-        $id_regexp
-    ));
-    $options = $wpdb->get_col($wpdb->prepare(
-        "SELECT option_value FROM {$wpdb->options} WHERE option_value LIKE %s OR ((option_name = 'site_icon' OR option_name LIKE %s) AND option_value REGEXP %s)",
-        $like,
-        $wpdb->esc_like('theme_mods_') . '%',
-        $id_regexp
-    ));
+    $meta = $wpdb->get_results($wpdb->prepare(
+        "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key NOT IN ('_edit_lock', '_edit_last', '_wp_attached_file', '_wp_attachment_metadata', '_wp_attachment_backup_sizes') AND " . $any('meta_value'),
+        $likes
+    ), ARRAY_N);
+    $options = $wpdb->get_results($wpdb->prepare(
+        "SELECT option_name, option_value FROM {$wpdb->options} WHERE " . $any('option_value'),
+        $likes
+    ), ARRAY_N);
 
-    return array_merge($contents, $meta, $options);
+    foreach ($groups as $key => $group) {
+        $ids = array_map('intval', $group['ids']);
+        $checked = array_map('intval', $group['checked']);
+        $has_stem = function ($text) use ($group) {
+            foreach ($group['stems'] as $stem) {
+                if (stripos((string) $text, (string) $stem) !== false) return true;
+            }
+            return false;
+        };
+        $has_id = function ($text) use ($checked) {
+            foreach ($checked as $id) {
+                if (strpos((string) $text, (string) $id) !== false) return true;
+            }
+            return false;
+        };
+
+        foreach ((array) $contents as $text) {
+            if ($has_stem($text) || $has_id($text)) $result[$key][] = $text;
+        }
+        foreach ((array) $meta as $row) {
+            if (in_array((int) $row[0], $ids, true)) continue;
+            if ($has_stem($row[1]) || $has_id($row[1])) $result[$key][] = $row[1];
+        }
+        foreach ((array) $options as $row) {
+            $id_option = $row[0] === 'site_icon' || strpos((string) $row[0], 'theme_mods_') === 0;
+            if ($has_stem($row[1]) || ($id_option && $has_id($row[1]))) $result[$key][] = $row[1];
+        }
+    }
+
+    return $result;
 }
 
 /**
@@ -1149,6 +1343,15 @@ add_action('admin_post_grandranker_save', function () {
     exit;
 });
 
+add_action('admin_post_grandranker_start_connect', function () {
+    if (!current_user_can('manage_options')) wp_die('Forbidden');
+    check_admin_referer('grandranker_start_connect');
+
+    grandranker_new_connect_state();
+    wp_redirect(grandranker_connect_url());
+    exit;
+});
+
 add_action('admin_post_grandranker_save_settings', function () {
     if (!current_user_can('manage_options')) wp_die('Forbidden');
     check_admin_referer('grandranker_save_settings');
@@ -1175,7 +1378,7 @@ add_action('admin_post_grandranker_save_settings', function () {
 });
 
 function grandranker_render_settings_page() {
-    $connected      = !empty(get_option(GRANDRANKER_OPT_SECRET));
+    $connected      = grandranker_is_connected();
     $connection_key = (string) get_option(GRANDRANKER_OPT_TOKEN, '');
     $error          = isset($_GET['grandranker_error'])
         ? sanitize_text_field(rawurldecode(wp_unslash($_GET['grandranker_error'])))
@@ -1183,6 +1386,24 @@ function grandranker_render_settings_page() {
     $success        = !empty($_GET['grandranker_connected']);
     $settings_saved = !empty($_GET['grandranker_settings_saved']);
     $disconnected   = !empty($_GET['grandranker_disconnected']);
+
+    $just_connected = false;
+    $connect_error  = null;
+    if (!$connected && isset($_GET['grandranker_code'], $_GET['grandranker_state']) && current_user_can('manage_options')) {
+        $result = grandranker_complete_connect(
+            sanitize_text_field(wp_unslash($_GET['grandranker_code'])),
+            sanitize_text_field(wp_unslash($_GET['grandranker_state']))
+        );
+        if ($result === true) {
+            $connected = $just_connected = true;
+        } else {
+            $connect_error = $result->get_error_code();
+        }
+    }
+    $connect_reason = [
+        'expired' => 'The connect link expired. Click the button and it takes a few seconds.',
+        'paused'  => 'Your GrandRanker plan is paused.',
+    ][$connect_error] ?? 'Something went wrong. Click the button to try again.';
     ?>
     <div class="wrap">
         <style>
@@ -1203,6 +1424,9 @@ function grandranker_render_settings_page() {
                 background: #edfaef;
                 border: 1px solid #68de7c;
             }
+            .grandranker-key-toggle { margin: 12px 0; }
+            .grandranker-key-toggle summary { cursor: pointer; color: #2271b1; }
+            .grandranker-key-toggle summary:hover { color: #135e96; }
         </style>
         <h1>Grandranker</h1>
         <?php if ($disconnected): ?>
@@ -1213,6 +1437,33 @@ function grandranker_render_settings_page() {
             <div class="notice notice-success"><p>Connected to Grandranker.</p></div>
         <?php elseif ($error): ?>
             <div class="notice notice-error"><p><?php echo esc_html($error); ?></p></div>
+        <?php endif; ?>
+
+        <?php if ($just_connected): ?>
+            <div class="card">
+                <h2>Connected to GrandRanker</h2>
+                <p>New articles for <?php echo esc_html((string) parse_url(home_url(), PHP_URL_HOST)); ?> appear in Posts. You don't need to do anything else.</p>
+                <p><a class="button button-primary" href="<?php echo esc_url(GRANDRANKER_API_BASE . '/dashboard'); ?>">Back to GrandRanker</a></p>
+            </div>
+        <?php elseif (!$connected): ?>
+            <?php if ($connect_error !== null): ?>
+                <div class="notice notice-error inline">
+                    <p><strong>Not connected yet</strong></p>
+                    <p><?php echo esc_html($connect_reason); ?></p>
+                </div>
+            <?php else: ?>
+                <div class="card">
+                    <h2>Connect to GrandRanker</h2>
+                    <p>Connect this site to publish your GrandRanker articles here.</p>
+                </div>
+            <?php endif; ?>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <input type="hidden" name="action" value="grandranker_start_connect" />
+                <?php wp_nonce_field('grandranker_start_connect'); ?>
+                <button type="submit" class="button button-primary">Connect to GrandRanker</button>
+            </form>
+            <details class="grandranker-key-toggle"<?php echo ($error !== '' || $connection_key !== '') ? ' open' : ''; ?>>
+                <summary>Use a connection key instead</summary>
         <?php endif; ?>
 
         <p>
@@ -1248,6 +1499,9 @@ function grandranker_render_settings_page() {
             </table>
             <?php submit_button('Save & Connect'); ?>
         </form>
+        <?php if (!$connected): ?>
+            </details>
+        <?php endif; ?>
 
         <?php if ($connected): ?>
         <hr />
@@ -1329,6 +1583,7 @@ add_action('admin_post_grandranker_disconnect', function () {
     delete_option(GRANDRANKER_OPT_SEO_PLUGIN);
     // Stop serving the ownership-proof key file for a site that revoked us.
     delete_option(GRANDRANKER_OPT_INDEXNOW_KEY);
+    delete_option(GRANDRANKER_OPT_CONNECT_STATE);
     wp_clear_scheduled_hook('grandranker_poll_deliveries');
 
     wp_safe_redirect(add_query_arg([
@@ -1356,6 +1611,8 @@ register_activation_hook(__FILE__, function () {
     if (!wp_next_scheduled('grandranker_poll_deliveries')) {
         wp_schedule_event(time(), 'grandranker_one_minute', 'grandranker_poll_deliveries');
     }
+    grandranker_new_connect_state();
+    set_transient(GRANDRANKER_TRANSIENT_ACTIVATION_REDIRECT, 1, 300);
 });
 
 register_deactivation_hook(__FILE__, function () {
@@ -1366,6 +1623,19 @@ add_action('init', function () {
     if (!wp_next_scheduled('grandranker_poll_deliveries')) {
         wp_schedule_event(time(), 'grandranker_one_minute', 'grandranker_poll_deliveries');
     }
+});
+
+add_action('admin_init', function () {
+    if (!get_transient(GRANDRANKER_TRANSIENT_ACTIVATION_REDIRECT)) return;
+    if (wp_doing_ajax() || wp_doing_cron()) return;
+
+    // A bulk activation of several plugins must not send the admin away.
+    delete_transient(GRANDRANKER_TRANSIENT_ACTIVATION_REDIRECT);
+    if (isset($_GET['activate-multi']) || is_network_admin()) return;
+    if (!current_user_can('manage_options') || grandranker_is_connected()) return;
+
+    wp_redirect(grandranker_connect_url());
+    exit;
 });
 
 add_action('admin_init', function () {

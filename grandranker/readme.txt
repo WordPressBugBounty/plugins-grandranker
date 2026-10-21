@@ -4,7 +4,7 @@ Tags: seo, ai, content, publishing, articles
 Requires at least: 5.6
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.6.1
+Stable tag: 1.7.0
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -66,6 +66,21 @@ The article is sent to your WordPress site via a signed REST API call. The plugi
 Yes. Grandranker can send a delete request to move the WordPress post to the trash.
 
 == Changelog ==
+
+= 1.7.0 =
+* Connects by itself after activation — no key needed.
+
+= 1.6.5 =
+* Duplicate cleanup check for a post with more than a thousand image copies: the site is searched only for the copies being checked, so the check no longer times out. What counts as a copy that is safe to remove is unchanged
+
+= 1.6.4 =
+* Duplicate cleanup check for posts with many image copies: one post can now be checked over several short requests, so it no longer times out on slow hosts. What counts as a copy that is safe to remove is unchanged
+
+= 1.6.3 =
+* Faster duplicate cleanup check: the site is searched once per page of posts instead of once per image, with a simpler search, so the check no longer times out on sites with a large database or a slow host. What counts as a copy that is safe to remove is unchanged
+
+= 1.6.2 =
+* Updating an article from Grandranker keeps a published or scheduled post live. Before, with "Post status" set to Draft or Pending Review, every update turned a post you had already published back into a draft and took it off your blog
 
 = 1.6.1 =
 * Safer duplicate cleanup: a copy is removed only when Grandranker created it and nothing on the site uses it. Its id and its file name, in every size, must appear in no post content, post meta (page builders, galleries, SEO plugin images) or site option
