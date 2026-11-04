@@ -4,7 +4,7 @@ Tags: seo, ai, content, publishing, articles
 Requires at least: 5.6
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.7.1
+Stable tag: 1.7.3
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -66,6 +66,12 @@ The article is sent to your WordPress site via a signed REST API call. The plugi
 Yes. Grandranker can send a delete request to move the WordPress post to the trash.
 
 == Changelog ==
+
+= 1.7.3 =
+* Fix: a post sent again without schema ("Let my SEO plugin handle structured data" on) no longer keeps printing the old schema.
+
+= 1.7.2 =
+* Updating an article that reaches your site through the queue keeps a post you already published live, as updates sent directly have done since 1.6.2. Before, with "Post status" set to Draft or Pending Review, such an update turned it back into a draft.
 
 = 1.7.1 =
 * Fix: the page right after connecting no longer asks for a connection key.

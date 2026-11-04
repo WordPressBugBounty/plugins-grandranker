@@ -3,14 +3,14 @@
  * Plugin Name: Grandranker
  * Plugin URI:  https://grandranker.com
  * Description: Automatically publish and update SEO-optimized articles from Grandranker — the AI content platform that helps you rank higher on Google and AI search engines.
- * Version:     1.7.1
+ * Version:     1.7.3
  * Author:      Grandranker
  * License:     MIT
  */
 
 defined('ABSPATH') || exit;
 
-const GRANDRANKER_VERSION       = '1.7.1';
+const GRANDRANKER_VERSION       = '1.7.3';
 const GRANDRANKER_API_BASE      = 'https://app.grandranker.com';
 // Body images on these hosts are copied into the Media Library (task 934).
 const GRANDRANKER_IMAGE_HOSTS   = ['cdn.grandranker.com'];
@@ -459,9 +459,11 @@ function grandranker_build_meta_input($article) {
         }
     }
 
-    if (!empty($article['json_ld_schema'])) {
-        $meta['_grandranker_schema'] = wp_json_encode($article['json_ld_schema'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    }
+    // No schema (the "SEO plugin handles it" switch) must also empty what an
+    // earlier send left, or the old block keeps printing.
+    $meta['_grandranker_schema'] = !empty($article['json_ld_schema'])
+        ? wp_json_encode($article['json_ld_schema'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+        : '';
 
     return $meta;
 }
@@ -857,14 +859,21 @@ function grandranker_update_schema(WP_REST_Request $request) {
     $post_id = (int) $request['id'];
     $params = (array) $request->get_json_params();
     $schema = $params['json_ld_schema'] ?? null;
+    $clear = array_key_exists('json_ld_schema', $params) && ($schema === null || $schema === []);
 
-    if (!is_array($schema) || $schema === [] || array_keys($schema) === range(0, count($schema) - 1)) {
+    if (!$clear && (!is_array($schema) || $schema === [] || array_keys($schema) === range(0, count($schema) - 1))) {
         return new WP_REST_Response(['error' => 'json_ld_schema must be an object'], 400);
     }
 
     $refusal = grandranker_ownership_refusal($post_id, $params['grandranker_id'] ?? null);
     if ($refusal) {
         return $refusal;
+    }
+
+    if ($clear) {
+        delete_post_meta($post_id, '_grandranker_schema');
+
+        return new WP_REST_Response(['post_id' => $post_id, 'updated' => true], 200);
     }
 
     // update_post_meta() strips one level of slashes, like wp_insert_post().
@@ -1738,7 +1747,7 @@ function grandranker_process_publish_delivery($delivery) {
         'post_name'    => sanitize_title($article['slug'] ?? $article['title']),
         'post_content' => grandranker_clean_content_html($article['content_html'] ?? ''),
         'post_excerpt' => $article['meta_description'] ?? '',
-        'post_status'  => grandranker_get_post_status(),
+        'post_status'  => grandranker_post_status_for($existing_id),
         'post_type'    => 'post',
         'meta_input'   => grandranker_build_meta_input($article),
     ];
