@@ -3,14 +3,14 @@
  * Plugin Name: Grandranker
  * Plugin URI:  https://grandranker.com
  * Description: Automatically publish and update SEO-optimized articles from Grandranker — the AI content platform that helps you rank higher on Google and AI search engines.
- * Version:     1.7.3
+ * Version:     1.8.0
  * Author:      Grandranker
  * License:     MIT
  */
 
 defined('ABSPATH') || exit;
 
-const GRANDRANKER_VERSION       = '1.7.3';
+const GRANDRANKER_VERSION       = '1.8.0';
 const GRANDRANKER_API_BASE      = 'https://app.grandranker.com';
 // Body images on these hosts are copied into the Media Library (task 934).
 const GRANDRANKER_IMAGE_HOSTS   = ['cdn.grandranker.com'];
@@ -233,6 +233,18 @@ add_action('rest_api_init', function () {
         'callback'            => 'grandranker_ping',
         'permission_callback' => 'grandranker_verify_signature',
     ]);
+
+    register_rest_route('grandranker/v1', '/seo/read', [
+        'methods'             => 'POST',
+        'callback'            => 'grandranker_seo_read',
+        'permission_callback' => 'grandranker_verify_timed_signature',
+    ]);
+
+    register_rest_route('grandranker/v1', '/seo/apply', [
+        'methods'             => 'POST',
+        'callback'            => 'grandranker_seo_apply',
+        'permission_callback' => 'grandranker_verify_timed_signature',
+    ]);
 });
 
 function grandranker_ping() {
@@ -245,7 +257,8 @@ function grandranker_verify_signature(WP_REST_Request $request) {
         return new WP_Error('grandranker_not_connected', 'Plugin is not connected.', ['status' => 401]);
     }
 
-    $provided = $request->get_header('x-grandranker-signature');
+    $provided = $request->get_header('x-connector-signature');
+    if (empty($provided)) $provided = $request->get_header('x-grandranker-signature'); // @brand-strip
     if (empty($provided)) {
         return new WP_Error('grandranker_missing_signature', 'Missing signature header.', ['status' => 401]);
     }
@@ -259,6 +272,410 @@ function grandranker_verify_signature(WP_REST_Request $request) {
 
     return true;
 }
+
+/**
+ * The site-fix routes change the customer's own pages, so a captured request
+ * must not work again later: the signature covers "timestamp.body" and the
+ * timestamp must be within 5 minutes of the site's clock.
+ */
+function grandranker_verify_timed_signature(WP_REST_Request $request) {
+    $secret = get_option(GRANDRANKER_OPT_SECRET);
+    if (empty($secret)) {
+        return new WP_Error('grandranker_not_connected', 'Plugin is not connected.', ['status' => 401]);
+    }
+
+    $provided = $request->get_header('x-connector-signature');
+    if (empty($provided)) $provided = $request->get_header('x-grandranker-signature'); // @brand-strip
+    $timestamp = (string) $request->get_header('x-connector-timestamp');
+    if (empty($provided) || !preg_match('/^\d{9,11}$/', $timestamp)) {
+        return new WP_Error('grandranker_missing_signature', 'Missing signature or timestamp header.', ['status' => 401]);
+    }
+
+    if (abs(time() - (int) $timestamp) > GRANDRANKER_SIGNATURE_MAX_AGE) {
+        return new WP_Error('stale_request', 'The request is too old.', ['status' => 401]);
+    }
+
+    $expected = hash_hmac('sha256', $timestamp . '.' . $request->get_body(), $secret);
+    if (!hash_equals($expected, (string) $provided)) {
+        return new WP_Error('grandranker_invalid_signature', 'Invalid signature.', ['status' => 401]);
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Site fixes (1.8.0): GrandRanker reads and writes a fixed set of head-level
+// SEO fields on the customer's own pages, only after the customer approved a
+// Before -> After in the app. Never the page body, title shown on the page or
+// excerpt: no code below calls wp_update_post().
+// ---------------------------------------------------------------------------
+
+const GRANDRANKER_SIGNATURE_MAX_AGE = 300;
+const GRANDRANKER_SEO_READ_MAX_URLS = 50;
+const GRANDRANKER_SEO_APPLY_MAX_CHANGES = 20;
+const GRANDRANKER_SEO_FIELDS = ['meta_title', 'meta_description', 'image_alt', 'json_ld', 'robots_noindex', 'llms_txt'];
+const GRANDRANKER_OPT_LLMS_TXT = 'grandranker_llms_txt';
+
+/** Front page first (url_to_postid() returns 0 for it), then any published post, page, product or CPT. */
+function grandranker_resolve_page_url(string $url): int {
+    $path = trim((string) wp_parse_url($url, PHP_URL_PATH), '/');
+    $home_path = trim((string) wp_parse_url(home_url('/'), PHP_URL_PATH), '/');
+
+    if ($path === $home_path) {
+        $front = get_option('show_on_front') === 'page' ? (int) get_option('page_on_front') : 0;
+
+        return $front;
+    }
+
+    return (int) url_to_postid($url);
+}
+
+function grandranker_is_fixable_post(int $post_id): bool {
+    $post = $post_id ? get_post($post_id) : null;
+
+    return $post && $post->post_status === 'publish' && !in_array($post->post_type, ['attachment', 'revision', 'nav_menu_item'], true);
+}
+
+/** The meta key the active SEO plugin reads for a field, or null when no SEO plugin is active. */
+function grandranker_seo_key(string $field) {
+    $keys = [
+        'yoast'    => ['meta_title' => '_yoast_wpseo_title', 'meta_description' => '_yoast_wpseo_metadesc'],
+        'rankmath' => ['meta_title' => 'rank_math_title', 'meta_description' => 'rank_math_description'],
+        'aioseo'   => ['meta_title' => '_aioseo_title', 'meta_description' => '_aioseo_description'],
+    ];
+    $seo = grandranker_active_seo_plugin();
+
+    return $seo ? ($keys[$seo][$field] ?? null) : null;
+}
+
+function grandranker_own_seo_key(string $field): string {
+    return $field === 'meta_title' ? '_grandranker_meta_title' : '_grandranker_meta_description';
+}
+
+/** The value a field holds now, as the app compares it ("" = nothing set). */
+function grandranker_seo_raw(string $field, int $id): string {
+    switch ($field) {
+        case 'meta_title':
+        case 'meta_description':
+            $key = grandranker_seo_key($field) ?? grandranker_own_seo_key($field);
+
+            return (string) get_post_meta($id, $key, true);
+        case 'image_alt':
+            return (string) get_post_meta($id, '_wp_attachment_image_alt', true);
+        case 'json_ld':
+            return (string) get_post_meta($id, '_grandranker_schema', true);
+        case 'robots_noindex':
+            return grandranker_is_noindex($id) ? '1' : '0';
+        case 'llms_txt':
+            return (string) get_option(GRANDRANKER_OPT_LLMS_TXT, '');
+    }
+
+    return '';
+}
+
+function grandranker_is_noindex(int $id): bool {
+    switch (grandranker_active_seo_plugin()) {
+        case 'yoast':
+            return (string) get_post_meta($id, '_yoast_wpseo_meta-robots-noindex', true) === '1';
+        case 'rankmath':
+            return in_array('noindex', (array) get_post_meta($id, 'rank_math_robots', true), true);
+    }
+
+    return false;
+}
+
+/** Attachments shown on the page (body + featured image) whose alt text is empty. */
+function grandranker_images_missing_alt(int $id): array {
+    $ids = [];
+    $content = (string) get_post_field('post_content', $id);
+    if (preg_match_all('/wp-image-(\d+)/', $content, $m)) {
+        $ids = array_map('intval', $m[1]);
+    }
+    $thumb = (int) get_post_thumbnail_id($id);
+    if ($thumb) $ids[] = $thumb;
+
+    $missing = [];
+    foreach (array_unique($ids) as $attachment_id) {
+        if (trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true)) !== '') continue;
+        $src = wp_get_attachment_url($attachment_id);
+        if ($src) $missing[] = ['attachment_id' => $attachment_id, 'src' => $src];
+    }
+
+    return $missing;
+}
+
+function grandranker_schema_types(int $id): array {
+    $schema = json_decode((string) get_post_meta($id, '_grandranker_schema', true), true);
+    if (!is_array($schema)) return [];
+
+    $nodes = isset($schema['@graph']) && is_array($schema['@graph']) ? $schema['@graph'] : [$schema];
+    $types = [];
+    foreach ($nodes as $node) {
+        foreach ((array) ($node['@type'] ?? []) as $type) {
+            if (is_string($type)) $types[] = $type;
+        }
+    }
+
+    return array_values(array_unique($types));
+}
+
+function grandranker_seo_read(WP_REST_Request $request) {
+    $urls = (array) (((array) $request->get_json_params())['urls'] ?? []);
+    if (count($urls) > GRANDRANKER_SEO_READ_MAX_URLS) {
+        return new WP_REST_Response(['code' => 'too_many_urls', 'max' => GRANDRANKER_SEO_READ_MAX_URLS], 422);
+    }
+
+    $pages = [];
+    foreach ($urls as $url) {
+        $url = (string) $url;
+        $id = grandranker_resolve_page_url($url);
+        if (!grandranker_is_fixable_post($id)) {
+            $pages[] = ['url' => $url, 'found' => false, 'reason' => 'not_a_wordpress_page'];
+            continue;
+        }
+
+        $title = grandranker_seo_raw('meta_title', $id);
+        $pages[] = [
+            'url' => $url,
+            'found' => true,
+            'target' => ['type' => 'wp_post', 'id' => $id, 'post_type' => get_post($id)->post_type],
+            'seo_plugin' => grandranker_active_seo_plugin() ?? 'none',
+            'fields' => [
+                'meta_title' => ['raw' => $title, 'effective' => $title !== '' ? $title : (string) get_the_title($id)],
+                'meta_description' => ['raw' => grandranker_seo_raw('meta_description', $id), 'effective' => grandranker_seo_raw('meta_description', $id)],
+                'json_ld' => ['raw' => grandranker_seo_raw('json_ld', $id)],
+                'robots_noindex' => grandranker_is_noindex($id),
+            ],
+            'images_missing_alt' => grandranker_images_missing_alt($id),
+            'schema_types' => grandranker_schema_types($id),
+        ];
+    }
+
+    return new WP_REST_Response([
+        'pages' => $pages,
+        'llms_txt' => (string) get_option(GRANDRANKER_OPT_LLMS_TXT, ''),
+    ], 200);
+}
+
+function grandranker_seo_apply(WP_REST_Request $request) {
+    $changes = (array) (((array) $request->get_json_params())['changes'] ?? []);
+    if (count($changes) > GRANDRANKER_SEO_APPLY_MAX_CHANGES) {
+        return new WP_REST_Response(['code' => 'too_many_changes', 'max' => GRANDRANKER_SEO_APPLY_MAX_CHANGES], 422);
+    }
+
+    $results = [];
+    foreach ($changes as $change) {
+        $results[] = grandranker_seo_apply_one((array) $change);
+    }
+
+    return new WP_REST_Response(['results' => $results], 200);
+}
+
+function grandranker_seo_apply_one(array $change): array {
+    $change_id = (string) ($change['change_id'] ?? '');
+    $field = (string) ($change['field'] ?? '');
+    $target = (array) ($change['target'] ?? []);
+    $id = (int) ($target['id'] ?? 0);
+    $new = (string) ($change['new_value'] ?? '');
+    $reply = fn ($result, $extra = []) => ['change_id' => $change_id, 'result' => $result] + $extra;
+
+    if (!in_array($field, GRANDRANKER_SEO_FIELDS, true)) {
+        return $reply('unsupported_field');
+    }
+
+    $type = (string) ($target['type'] ?? '');
+    $valid_target = ($field === 'llms_txt' && $type === 'wp_site')
+        || ($field === 'image_alt' && $type === 'wp_attachment' && ($post = get_post($id)) && $post->post_type === 'attachment')
+        || (!in_array($field, ['llms_txt', 'image_alt'], true) && $type === 'wp_post' && grandranker_is_fixable_post($id));
+    if (!$valid_target) {
+        return $reply('not_found');
+    }
+
+    // A retry after a timed-out call: the first call already wrote it. Answer
+    // applied, not drift, so the app can still undo it and close the issue.
+    $live = grandranker_seo_raw($field, $id);
+    if ($live === $new) {
+        // The first call may have timed out before its cache refresh finished.
+        grandranker_refresh_yoast_indexable($field, $id, $new);
+        if ($field !== 'llms_txt') {
+            grandranker_refresh_page_caches($field === 'image_alt' ? 0 : $id);
+        }
+
+        return $reply('applied', ['previous' => (string) ($change['expected_previous'] ?? ''), 'already' => true]);
+    }
+
+    if ($field === 'robots_noindex' && !grandranker_noindex_change_allowed($id, $new)) {
+        return $reply(grandranker_active_seo_plugin() === null || grandranker_active_seo_plugin() === 'aioseo' ? 'unsupported_field' : 'unsupported_value');
+    }
+
+    if ($field === 'json_ld' && $new !== '') {
+        $decoded = json_decode($new, true);
+        if (!is_array($decoded) || $decoded === []) {
+            return $reply('invalid_value');
+        }
+    }
+
+    // An alt of only spaces counts as empty, the same as the read reports it.
+    if (($field === 'image_alt' ? trim($live) : $live) !== (string) ($change['expected_previous'] ?? '')) {
+        return $reply('drift', ['live' => $live]);
+    }
+
+    grandranker_seo_write($field, $id, $new);
+    if ($field !== 'llms_txt') {
+        grandranker_refresh_page_caches($field === 'image_alt' ? 0 : $id);
+    }
+
+    return $reply('applied', ['previous' => $live]);
+}
+
+/**
+ * We only ever take noindex off. Putting it back is allowed only as the undo of
+ * our own removal, so the plugin can never hide a page Google could see.
+ */
+function grandranker_noindex_change_allowed(int $id, string $new): bool {
+    $seo = grandranker_active_seo_plugin();
+    if ($seo !== 'yoast' && $seo !== 'rankmath') return false;
+    if ($new === '0') return true;
+
+    return $new === '1' && (string) get_post_meta($id, '_grandranker_noindex_removed', true) === '1';
+}
+
+function grandranker_seo_write(string $field, int $id, string $value): void {
+    switch ($field) {
+        case 'meta_title':
+        case 'meta_description':
+            $keys = array_filter([grandranker_own_seo_key($field), grandranker_seo_key($field)]);
+            foreach ($keys as $key) {
+                if ($value === '') {
+                    delete_post_meta($id, $key);
+                } else {
+                    update_post_meta($id, $key, wp_slash($value));
+                }
+            }
+            break;
+        case 'image_alt':
+            if ($value === '') {
+                delete_post_meta($id, '_wp_attachment_image_alt');
+                delete_post_meta($id, '_grandranker_alt_fixed');
+            } else {
+                update_post_meta($id, '_wp_attachment_image_alt', wp_slash($value));
+                update_post_meta($id, '_grandranker_alt_fixed', '1');
+            }
+            break;
+        case 'json_ld':
+            if ($value === '') {
+                delete_post_meta($id, '_grandranker_schema');
+            } else {
+                update_post_meta($id, '_grandranker_schema', wp_slash(wp_json_encode(json_decode($value, true), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)));
+            }
+            break;
+        case 'robots_noindex':
+            grandranker_write_noindex($id, $value === '1');
+            break;
+        case 'llms_txt':
+            // Not autoloaded: only the /llms.txt request reads it.
+            update_option(GRANDRANKER_OPT_LLMS_TXT, $value, false);
+            break;
+    }
+
+    grandranker_refresh_yoast_indexable($field, $id, $value);
+}
+
+function grandranker_write_noindex(int $id, bool $noindex): void {
+    if (grandranker_active_seo_plugin() === 'yoast') {
+        if ($noindex) {
+            update_post_meta($id, '_yoast_wpseo_meta-robots-noindex', '1');
+        } else {
+            delete_post_meta($id, '_yoast_wpseo_meta-robots-noindex');
+        }
+    } else {
+        $robots = array_values(array_diff((array) get_post_meta($id, 'rank_math_robots', true), ['noindex', 'index', '']));
+        $robots[] = $noindex ? 'noindex' : 'index';
+        update_post_meta($id, 'rank_math_robots', $robots);
+    }
+
+    if ($noindex) {
+        delete_post_meta($id, '_grandranker_noindex_removed');
+    } else {
+        update_post_meta($id, '_grandranker_noindex_removed', '1');
+    }
+}
+
+/**
+ * Yoast prints from its indexables table, not post meta, so a meta write alone
+ * changes nothing on the page until Yoast rebuilds the row. Update the row we
+ * changed; any Yoast internals error is ignored (the app checks the live page).
+ */
+function grandranker_refresh_yoast_indexable(string $field, int $id, string $value): void {
+    do_action('grandranker_seo_field_written', $field, $id, $value);
+
+    if (grandranker_active_seo_plugin() !== 'yoast' || !function_exists('YoastSEO') || $field === 'llms_txt') return;
+
+    $columns = ['meta_title' => 'title', 'meta_description' => 'description', 'robots_noindex' => 'is_robots_noindex'];
+    if (!isset($columns[$field])) return;
+
+    try {
+        $repository = YoastSEO()->classes->get('Yoast\WP\SEO\Repositories\Indexable_Repository');
+        $indexable = $repository ? $repository->find_by_id_and_type($id, 'post', false) : null;
+        if ($indexable) {
+            $indexable->{$columns[$field]} = $field === 'robots_noindex' ? ($value === '1' ? true : null) : ($value === '' ? null : $value);
+            $indexable->save();
+        }
+    } catch (\Throwable $e) {
+        // The verify step in the app reports "not visible yet" instead.
+    }
+}
+
+function grandranker_refresh_page_caches(int $id): void {
+    if ($id) {
+        clean_post_cache($id);
+        do_action('litespeed_purge_post', $id);
+        if (function_exists('rocket_clean_post')) rocket_clean_post($id);
+    } else {
+        // An image can sit on any page: purge everything the cache plugins allow.
+        do_action('litespeed_purge_all');
+        if (function_exists('rocket_clean_domain')) rocket_clean_domain();
+    }
+}
+
+/**
+ * Fill alt text on render for images whose attachment alt we fixed, when the
+ * block HTML has none. post_content is never edited.
+ */
+function grandranker_fill_img_alt($tag, $context = '', $attachment_id = 0) {
+    $attachment_id = (int) $attachment_id;
+    if (!$attachment_id && preg_match('/wp-image-(\d+)/', (string) $tag, $m)) {
+        $attachment_id = (int) $m[1];
+    }
+    if (!$attachment_id || (string) get_post_meta($attachment_id, '_grandranker_alt_fixed', true) !== '1') return $tag;
+
+    $alt = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
+    if ($alt === '') return $tag;
+
+    if (preg_match('/\salt\s*=\s*("([^"]*)"|\'([^\']*)\')/i', $tag, $m)) {
+        if (trim(($m[2] ?? '') . ($m[3] ?? '')) !== '') return $tag;
+
+        return str_replace($m[0], ' alt="' . esc_attr($alt) . '"', $tag);
+    }
+
+    return preg_replace('/^<img\b/i', '<img alt="' . esc_attr($alt) . '"', $tag, 1);
+}
+add_filter('wp_content_img_tag', 'grandranker_fill_img_alt', 10, 3);
+
+/** /llms.txt from the plugin option, unless the site has a real file (the web server serves that first). */
+function grandranker_serve_llms_txt(): void {
+    $path = trim((string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH), '/');
+    if ($path !== 'llms.txt') return;
+
+    $text = (string) get_option(GRANDRANKER_OPT_LLMS_TXT, '');
+    if ($text === '' || headers_sent()) return;
+
+    header('Content-Type: text/plain; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
+    echo $text; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- plain text file, not HTML.
+    exit;
+}
+add_action('init', 'grandranker_serve_llms_txt');
 
 /**
  * wp_insert_post() gives an existing post today's date unless the date is
@@ -468,8 +885,10 @@ function grandranker_build_meta_input($article) {
     return $meta;
 }
 
+// 1.8.0: any singular page, not only posts. Only pages that hold our key print
+// anything, and site fixes store it only after the customer approved it.
 add_action('wp_head', function () {
-    if (!is_singular('post')) return;
+    if (!is_singular()) return;
 
     $schema = get_post_meta(get_the_ID(), '_grandranker_schema', true);
     if (empty($schema)) return;
@@ -492,11 +911,20 @@ add_action('wp_head', function () {
 // tags, so a description fixed in GrandRanker never reached the page and the
 // Site Audit flagged it again after every republish.
 add_action('wp_head', function () {
-    if (!is_singular('post') || grandranker_active_seo_plugin() !== null) return;
+    if (!is_singular() || grandranker_active_seo_plugin() !== null) return;
 
     $post_id = get_the_ID();
     $title = get_post_meta($post_id, '_grandranker_meta_title', true) ?: get_the_title($post_id);
     $description = get_post_meta($post_id, '_grandranker_meta_description', true);
+
+    // Pages, products and CPTs (site fixes, 1.8.0): only the description we
+    // wrote, never Open Graph tags the site did not ask for.
+    if (!is_singular('post')) {
+        if ($description !== '') {
+            echo '<meta name="description" content="' . esc_attr($description) . '" />' . "\n";
+        }
+        return;
+    }
 
     if ($description !== '') {
         echo '<meta name="description" content="' . esc_attr($description) . '" />' . "\n";
@@ -518,13 +946,16 @@ add_action('wp_head', function () {
 
 // Ticket 2678: without an SEO plugin WordPress builds <title> from the post
 // title, so an SEO title fixed in GrandRanker (Apply Fix) never reached the page.
-add_filter('pre_get_document_title', function ($title) {
-    if (!is_singular('post') || grandranker_active_seo_plugin() !== null) return $title;
+// 1.8.0: any singular page, so a site fix on a page or product reaches <title> too.
+function grandranker_document_title($title) {
+    if (!is_singular() || grandranker_active_seo_plugin() !== null) return $title;
 
     $meta_title = get_post_meta(get_the_ID(), '_grandranker_meta_title', true);
 
-    return $meta_title !== '' ? $meta_title : $title;
-});
+    // WordPress prints this value inside <title> without escaping it.
+    return $meta_title !== '' ? esc_html(wp_strip_all_tags($meta_title)) : $title;
+}
+add_filter('pre_get_document_title', 'grandranker_document_title');
 
 function grandranker_active_seo_plugin() {
     // An explicit choice in the plugin settings wins over detection, the same
