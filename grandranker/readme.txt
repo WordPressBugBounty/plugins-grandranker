@@ -4,7 +4,7 @@ Tags: seo, ai, content, publishing, articles
 Requires at least: 5.6
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.8.0
+Stable tag: 1.8.1
 License: MIT
 License URI: https://opensource.org/licenses/MIT
 
@@ -66,6 +66,9 @@ The article is sent to your WordPress site via a signed REST API call. The plugi
 Yes. Grandranker can send a delete request to move the WordPress post to the trash.
 
 == Changelog ==
+
+= 1.8.1 =
+* Site fixes are safer: a value you typed yourself is never claimed or undone by us, image alt text is added cleanly in every image, and "show in Google" undo only works in the SEO plugin where it was changed.
 
 = 1.8.0 =
 * Site fixes: when you approve a fix in your Site Audit, GrandRanker can set the SEO title, Google description, image alt text, structured data and llms.txt on your own pages, and take a "hide from Google" setting off a page. Every change is shown to you first and can be undone. Your page text is never changed.

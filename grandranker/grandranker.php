@@ -3,14 +3,14 @@
  * Plugin Name: Grandranker
  * Plugin URI:  https://grandranker.com
  * Description: Automatically publish and update SEO-optimized articles from Grandranker — the AI content platform that helps you rank higher on Google and AI search engines.
- * Version:     1.8.0
+ * Version:     1.8.1
  * Author:      Grandranker
  * License:     MIT
  */
 
 defined('ABSPATH') || exit;
 
-const GRANDRANKER_VERSION       = '1.8.0';
+const GRANDRANKER_VERSION       = '1.8.1';
 const GRANDRANKER_API_BASE      = 'https://app.grandranker.com';
 // Body images on these hosts are copied into the Media Library (task 934).
 const GRANDRANKER_IMAGE_HOSTS   = ['cdn.grandranker.com'];
@@ -318,6 +318,13 @@ const GRANDRANKER_OPT_LLMS_TXT = 'grandranker_llms_txt';
 
 /** Front page first (url_to_postid() returns 0 for it), then any published post, page, product or CPT. */
 function grandranker_resolve_page_url(string $url): int {
+    // A URL on another host (the audited main site when WordPress runs on a
+    // blog subdomain) is never this site's page.
+    $bare = fn ($u) => preg_replace('/^www\./i', '', strtolower((string) wp_parse_url($u, PHP_URL_HOST)));
+    if ($bare($url) !== $bare(home_url('/'))) {
+        return 0;
+    }
+
     $path = trim((string) wp_parse_url($url, PHP_URL_PATH), '/');
     $home_path = trim((string) wp_parse_url(home_url('/'), PHP_URL_PATH), '/');
 
@@ -493,8 +500,10 @@ function grandranker_seo_apply_one(array $change): array {
 
     // A retry after a timed-out call: the first call already wrote it. Answer
     // applied, not drift, so the app can still undo it and close the issue.
+    // Only for a write this plugin made: the same value typed by hand is the
+    // customer's own change, so it stays drift and undo never touches it.
     $live = grandranker_seo_raw($field, $id);
-    if ($live === $new) {
+    if ($live === $new && grandranker_seo_applied_marker($field, $id) === grandranker_seo_change_hash($change_id, $new)) {
         // The first call may have timed out before its cache refresh finished.
         grandranker_refresh_yoast_indexable($field, $id, $new);
         if ($field !== 'llms_txt') {
@@ -521,11 +530,30 @@ function grandranker_seo_apply_one(array $change): array {
     }
 
     grandranker_seo_write($field, $id, $new);
+    grandranker_seo_mark_applied($field, $id, grandranker_seo_change_hash($change_id, $new));
     if ($field !== 'llms_txt') {
         grandranker_refresh_page_caches($field === 'image_alt' ? 0 : $id);
     }
 
     return $reply('applied', ['previous' => $live]);
+}
+
+function grandranker_seo_change_hash(string $change_id, string $new): string {
+    return md5($change_id . '|' . $new);
+}
+
+function grandranker_seo_applied_marker(string $field, int $id): string {
+    return $field === 'llms_txt'
+        ? (string) get_option('grandranker_sf_applied_llms_txt', '')
+        : (string) get_post_meta($id, '_grandranker_sf_applied_' . $field, true);
+}
+
+function grandranker_seo_mark_applied(string $field, int $id, string $hash): void {
+    if ($field === 'llms_txt') {
+        update_option('grandranker_sf_applied_llms_txt', $hash, false);
+    } else {
+        update_post_meta($id, '_grandranker_sf_applied_' . $field, $hash);
+    }
 }
 
 /**
@@ -537,7 +565,11 @@ function grandranker_noindex_change_allowed(int $id, string $new): bool {
     if ($seo !== 'yoast' && $seo !== 'rankmath') return false;
     if ($new === '0') return true;
 
-    return $new === '1' && (string) get_post_meta($id, '_grandranker_noindex_removed', true) === '1';
+    // The marker names the SEO plugin we removed it in: after a switch to
+    // another SEO plugin, undo must not add noindex there.
+    $marker = (string) get_post_meta($id, '_grandranker_noindex_removed', true);
+
+    return $new === '1' && ($marker === $seo || ($marker === '1' && $seo === 'yoast'));
 }
 
 function grandranker_seo_write(string $field, int $id, string $value): void {
@@ -597,7 +629,7 @@ function grandranker_write_noindex(int $id, bool $noindex): void {
     if ($noindex) {
         delete_post_meta($id, '_grandranker_noindex_removed');
     } else {
-        update_post_meta($id, '_grandranker_noindex_removed', '1');
+        update_post_meta($id, '_grandranker_noindex_removed', (string) grandranker_active_seo_plugin());
     }
 }
 
@@ -652,10 +684,16 @@ function grandranker_fill_img_alt($tag, $context = '', $attachment_id = 0) {
     $alt = trim((string) get_post_meta($attachment_id, '_wp_attachment_image_alt', true));
     if ($alt === '') return $tag;
 
-    if (preg_match('/\salt\s*=\s*("([^"]*)"|\'([^\']*)\')/i', $tag, $m)) {
-        if (trim(($m[2] ?? '') . ($m[3] ?? '')) !== '') return $tag;
+    // Walk the real attributes, so text inside another attribute's quotes
+    // (title="... alt='' ...") is never taken for the alt attribute.
+    if (!preg_match('/^<img\b/i', $tag)) return $tag;
+    preg_match_all('/([^\s=\/>"\']+)(?:\s*=\s*("[^"]*"|\'[^\']*\'|[^\s"\'>]+))?/', $tag, $attrs, PREG_SET_ORDER | PREG_OFFSET_CAPTURE, 4);
+    foreach ($attrs as $attr) {
+        if (strtolower($attr[1][0]) !== 'alt') continue;
+        $value = isset($attr[2]) ? trim($attr[2][0], "\"' ") : '';
+        if (trim($value) !== '') return $tag;
 
-        return str_replace($m[0], ' alt="' . esc_attr($alt) . '"', $tag);
+        return substr($tag, 0, $attr[0][1]) . 'alt="' . esc_attr($alt) . '"' . substr($tag, $attr[0][1] + strlen($attr[0][0]));
     }
 
     return preg_replace('/^<img\b/i', '<img alt="' . esc_attr($alt) . '"', $tag, 1);
